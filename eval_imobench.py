@@ -579,6 +579,242 @@ present your final score in the format below.
             "judge_response": response,
         }
 
+
+class MathVerifyAnswerJudge:
+    def __init__(self) -> None:
+        try:
+            from math_verify import ExprExtractionConfig, LatexExtractionConfig, LatexNormalizationConfig, parse, verify
+        except ImportError as err:  # noqa: BLE001
+            raise RuntimeError(
+                "Math-Verify is not installed. Install `math-verify[antlr4_13_2]` to use "
+                "`--answer-grader-backend math_verify`."
+            ) from err
+
+        self._parse = parse
+        self._verify = verify
+        self._gold_cache: Dict[str, Any] = {}
+        self._gold_extraction_config = [
+            LatexExtractionConfig(),
+            ExprExtractionConfig(),
+        ]
+        # Prefer boxed math when present, and use stricter normalization for reward-style checking.
+        self._prediction_extraction_config = [
+            LatexExtractionConfig(
+                boxed_match_priority=0,
+                normalization_config=LatexNormalizationConfig(
+                    basic_latex=True,
+                    units=True,
+                    malformed_operators=False,
+                    nits=False,
+                    boxed="all",
+                    equations=False,
+                ),
+            ),
+            ExprExtractionConfig(),
+        ]
+
+    def _parse_gold(self, golden_answer: str) -> Any:
+        cached = self._gold_cache.get(golden_answer)
+        if cached is None and golden_answer not in self._gold_cache:
+            cached = self._parse(golden_answer, extraction_config=self._gold_extraction_config)
+            self._gold_cache[golden_answer] = cached
+        return self._gold_cache[golden_answer]
+
+    def _parse_prediction(self, text: str) -> Any:
+        return self._parse(text, extraction_config=self._prediction_extraction_config)
+
+    @staticmethod
+    def _extract_boxed_contents(text: str) -> List[str]:
+        needle = r"\boxed{"
+        contents: List[str] = []
+        start = 0
+        while True:
+            idx = text.find(needle, start)
+            if idx < 0:
+                break
+            i = idx + len(needle)
+            depth = 1
+            buf: List[str] = []
+            while i < len(text) and depth > 0:
+                ch = text[i]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                if depth > 0:
+                    buf.append(ch)
+                i += 1
+            if depth == 0:
+                contents.append("".join(buf).strip())
+                start = i
+            else:
+                break
+        return contents
+
+    @classmethod
+    def _cleanup_text(cls, text: str) -> str:
+        text = text.strip()
+        text = text.replace("$", "")
+        text = text.replace(r"\left", "")
+        text = text.replace(r"\right", "")
+        text = re.sub(r"\\(?:text|mathrm|operatorname)\{([^{}]*)\}", r"\1", text)
+        text = text.replace("{", "").replace("}", "")
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    @classmethod
+    def _normalize_text_answer(cls, text: str) -> str:
+        text = cls._cleanup_text(text).lower()
+        text = re.sub(r"\s*([(),])\s*", r"\1", text)
+        return text.strip(" .,:;")
+
+    @classmethod
+    def _prediction_candidates(cls, model_solution: str) -> List[str]:
+        candidates: List[str] = []
+        seen = set()
+
+        def add(text: str) -> None:
+            normalized = text.strip()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                candidates.append(normalized)
+
+        for boxed in reversed(cls._extract_boxed_contents(model_solution)[-3:]):
+            add(boxed)
+        add(model_solution)
+        lines = [line.strip() for line in model_solution.splitlines() if line.strip()]
+        if lines:
+            add(lines[-1])
+            if len(lines) > 1:
+                add(lines[-2])
+        add(model_solution.strip()[-500:])
+        return candidates
+
+    @classmethod
+    def _split_function_relation(cls, text: str) -> tuple[str, str, str] | None:
+        cleaned = cls._cleanup_text(text)
+        match = re.fullmatch(r"([A-Za-z]\w*)\s*\(\s*([A-Za-z]\w*)\s*\)\s*=\s*(.+)", cleaned)
+        if not match:
+            return None
+        name, arg, rhs = match.groups()
+        return name.lower(), arg.lower(), rhs.strip()
+
+    def _compare_function_relation(self, golden_answer: str, candidate: str) -> bool:
+        gold_relation = self._split_function_relation(golden_answer)
+        candidate_relation = self._split_function_relation(candidate)
+        if gold_relation is None or candidate_relation is None:
+            return False
+        if gold_relation[:2] != candidate_relation[:2]:
+            return False
+
+        try:
+            from sympy import simplify, sympify
+
+            gold_rhs = sympify(gold_relation[2].replace("^", "**"))
+            candidate_rhs = sympify(candidate_relation[2].replace("^", "**"))
+            return bool(simplify(gold_rhs - candidate_rhs) == 0)
+        except Exception:  # noqa: BLE001
+            pass
+
+        gold_rhs = self._parse(gold_relation[2], extraction_config=self._gold_extraction_config)
+        candidate_rhs = self._parse(candidate_relation[2], extraction_config=self._prediction_extraction_config)
+        if gold_rhs and candidate_rhs:
+            return bool(self._verify(gold_rhs, candidate_rhs, allow_set_relation_comp=True))
+        return self._normalize_text_answer(golden_answer) == self._normalize_text_answer(candidate)
+
+    def _matches_text_fallback(self, golden_answer: str, candidate: str) -> bool:
+        gold_norm = self._normalize_text_answer(golden_answer)
+        candidate_norm = self._normalize_text_answer(candidate)
+        if not gold_norm or not candidate_norm:
+            return False
+        if gold_norm == candidate_norm:
+            return True
+        if self._compare_function_relation(golden_answer, candidate):
+            return True
+        if gold_norm in {"no solutions", "no solution"}:
+            return "no solution" in candidate_norm
+        if gold_norm == "no positive integers":
+            return "no positive integer" in candidate_norm
+        if gold_norm == "all positive integers":
+            return "all positive integers" in candidate_norm or "every positive integer" in candidate_norm
+        if gold_norm == "taking the empty card":
+            return "empty card" in candidate_norm
+        if gold_norm.endswith(" is prime"):
+            subject = gold_norm[: -len(" is prime")].strip()
+            return "prime" in candidate_norm and (not subject or subject in candidate_norm)
+        return False
+
+    @staticmethod
+    def _result_payload(
+        correct: bool,
+        golden_answer: str,
+        parsed_gold: bool,
+        parsed_prediction: bool,
+        matched_candidate: str | None,
+    ) -> str:
+        return json.dumps(
+            {
+                "backend": "math_verify",
+                "correct": correct,
+                "golden_answer": golden_answer,
+                "gold_parsed": parsed_gold,
+                "prediction_parsed": parsed_prediction,
+                "matched_candidate": matched_candidate,
+            },
+            ensure_ascii=False,
+        )
+
+    def judge_answer(self, problem: str, model_solution: str, golden_answer: str) -> Dict[str, Any]:
+        del problem
+
+        parsed_gold = self._parse_gold(golden_answer)
+        prediction_candidates = self._prediction_candidates(model_solution)
+        prediction_parsed = False
+
+        if parsed_gold:
+            for candidate in prediction_candidates:
+                parsed_prediction = self._parse_prediction(candidate)
+                if parsed_prediction:
+                    prediction_parsed = True
+                    if self._verify(parsed_gold, parsed_prediction, allow_set_relation_comp=True):
+                        return {
+                            "correct": True,
+                            "judge_grade": "Correct",
+                            "judge_response": self._result_payload(
+                                True,
+                                golden_answer,
+                                True,
+                                True,
+                                candidate,
+                            ),
+                        }
+
+        for candidate in prediction_candidates:
+            if self._matches_text_fallback(golden_answer, candidate):
+                return {
+                    "correct": True,
+                    "judge_grade": "Correct",
+                    "judge_response": self._result_payload(
+                        True,
+                        golden_answer,
+                        bool(parsed_gold),
+                        prediction_parsed,
+                        candidate,
+                    ),
+                }
+
+        return {
+            "correct": False,
+            "judge_grade": "Incorrect",
+            "judge_response": self._result_payload(
+                False,
+                golden_answer,
+                bool(parsed_gold),
+                prediction_parsed,
+                prediction_candidates[0] if prediction_candidates else None,
+            ),
+        }
+
     def extract_gradingbench_label(self, model_response: str) -> str:
         prompt = f"""
 ## Instructions for Extracting Final Scores
@@ -849,7 +1085,7 @@ def save_summary_json_csv(path_prefix: Path, summary: Dict[str, Any]) -> None:
 def run_answerbench(
     model_name: str,
     generator: HFGenerator,
-    judge: GeminiJudge,
+    judge: Any,
     rows: Sequence[Dict[str, str]],
     output_path: Path,
     max_new_tokens: int,
@@ -906,7 +1142,7 @@ def run_answerbench(
 
 def run_proofbench(
     model_name: str,
-    generator: HFGenerator,
+    generator: HFGenerator | None,
     judge: GeminiJudge,
     rows: Sequence[Dict[str, str]],
     prediction_path: Path,
@@ -917,6 +1153,8 @@ def run_proofbench(
     pred_done = existing_ids(prediction_path, "problem_id")
     pending_predictions = [row for row in rows if row["Problem ID"] not in pred_done]
     if pending_predictions:
+        if generator is None:
+            raise RuntimeError("ProofBench generation requested without an initialized generator.")
         prompts = [proof_prompt(row["Problem"]) for row in pending_predictions]
         outputs = generator.generate(prompts, max_new_tokens=max_new_tokens, batch_size=batch_size)
         result_rows = []
@@ -943,7 +1181,6 @@ def run_proofbench(
     judged_done = existing_ids(judged_path, "problem_id")
     pending_judged = [row for row in predictions if row["problem_id"] not in judged_done]
     if pending_judged:
-        judged_rows = []
         for row in pending_judged:
             grade = judge.judge_proof(
                 problem_id=row["problem_id"],
@@ -952,8 +1189,7 @@ def run_proofbench(
                 reference_solution=row["reference_solution"],
                 grading_guidelines=row["grading_guidelines"],
             )
-            judged_rows.append({**row, **grade})
-        append_jsonl(judged_path, judged_rows)
+            append_jsonl(judged_path, [{**row, **grade}])
     return load_jsonl(judged_path)
 
 
@@ -1002,6 +1238,13 @@ def parse_args() -> argparse.Namespace:
         "--benchmarks",
         default="answerbench,proofbench,gradingbench",
         help="Comma-separated subset of answerbench,proofbench,gradingbench",
+    )
+    parser.add_argument(
+        "--answer-grader-backend",
+        choices=("gemini", "math_verify"),
+        default="gemini",
+        help="AnswerBench grader backend. Use gemini for paper-faithful AnswerAutoGrader, "
+        "math_verify for a cheaper local final-answer verifier.",
     )
     parser.add_argument(
         "--data-dir",
@@ -1097,30 +1340,34 @@ def main() -> int:
         raise RuntimeError("local_hf judge backend currently supports GradingBench-only runs.")
 
     model_summaries: Dict[str, Dict[str, Any]] = {}
-    solver_judge: GeminiJudge | None = None
+    answer_judge: Any = None
+    proof_judge: GeminiJudge | None = None
     for model_name in args.models:
         model_dir = ensure_dir(output_root / slugify(model_name))
         generator = None
         summary: Dict[str, Any] = {"model": model_name}
 
         if "answerbench" in benchmarks:
-            if solver_judge is None:
-                if not gemini_key:
-                    raise RuntimeError(
-                        f"Missing Gemini API key. Set {args.gemini_api_env} (or GOOGLE_API_KEY) in the environment."
+            if answer_judge is None:
+                if args.answer_grader_backend == "gemini":
+                    if not gemini_key:
+                        raise RuntimeError(
+                            f"Missing Gemini API key. Set {args.gemini_api_env} (or GOOGLE_API_KEY) in the environment."
+                        )
+                    answer_judge = GeminiJudge(
+                        api_key=gemini_key,
+                        model=args.gemini_model,
+                        temperature=args.judge_temperature,
+                        top_p=args.judge_top_p,
                     )
-                solver_judge = GeminiJudge(
-                    api_key=gemini_key,
-                    model=args.gemini_model,
-                    temperature=args.judge_temperature,
-                    top_p=args.judge_top_p,
-                )
+                else:
+                    answer_judge = MathVerifyAnswerJudge()
             if generator is None:
                 generator = HFGenerator(model_name=model_name, trust_remote_code=args.trust_remote_code)
             answer_rows = run_answerbench(
                 model_name=model_name,
                 generator=generator,
-                judge=solver_judge,
+                judge=answer_judge,
                 rows=answerbench_rows,
                 output_path=model_dir / "answerbench_predictions.jsonl",
                 max_new_tokens=args.answer_max_new_tokens,
@@ -1132,25 +1379,27 @@ def main() -> int:
             summary["answerbench"] = summarize_answerbench(answer_rows)
 
         if "proofbench" in benchmarks:
-            if solver_judge is None:
+            if proof_judge is None:
                 if not gemini_key:
                     raise RuntimeError(
                         f"Missing Gemini API key. Set {args.gemini_api_env} (or GOOGLE_API_KEY) in the environment."
                     )
-                solver_judge = GeminiJudge(
+                proof_judge = GeminiJudge(
                     api_key=gemini_key,
                     model=args.gemini_model,
                     temperature=args.judge_temperature,
                     top_p=args.judge_top_p,
                 )
-            if generator is None:
+            proof_prediction_path = model_dir / "proofbench_predictions.jsonl"
+            needs_proof_generation = len(existing_ids(proof_prediction_path, "problem_id")) < len(proofbench_rows)
+            if generator is None and needs_proof_generation:
                 generator = HFGenerator(model_name=model_name, trust_remote_code=args.trust_remote_code)
             proof_rows = run_proofbench(
                 model_name=model_name,
                 generator=generator,
-                judge=solver_judge,
+                judge=proof_judge,
                 rows=proofbench_rows,
-                prediction_path=model_dir / "proofbench_predictions.jsonl",
+                prediction_path=proof_prediction_path,
                 judged_path=model_dir / "proofbench_judged.jsonl",
                 max_new_tokens=args.proof_max_new_tokens,
                 batch_size=args.batch_size,

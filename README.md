@@ -16,6 +16,8 @@ Design policy:
   - `AnswerBench`: Gemini answer autograder
   - `ProofBench`: Gemini `ProofAutoGrader`-style prompt
   - `GradingBench`: vanilla grader prompt from the paper
+- Optional cheaper path:
+  - `AnswerBench`: local `Math-Verify` final-answer checker (`--answer-grader-backend math_verify`)
 
 What this repo is for:
 - reproducing IMO-Bench-style evaluation outside the RL training codebase
@@ -56,7 +58,32 @@ python3 eval_imobench.py \
   --output-root ./imobench_runs/smoke
 ```
 
-### 2. Paper-faithful GradingBench run with Gemini
+### 2. Paper-faithful full AnswerBench run with Gemini
+
+```bash
+export GEMINI_API_KEY='...'
+python3 eval_imobench.py \
+  --models deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --benchmarks answerbench \
+  --gemini-model gemini-2.5-pro \
+  --output-root ./imobench_runs/answerbench_gemini
+```
+
+### 3. Cheaper local AnswerBench run with Math-Verify
+
+This is not the paper-faithful `AnswerAutoGrader`, but it can verify most
+boxed final answers locally and includes a small fallback layer for the few
+AnswerBench gold answers that are plain-text or tuple-style.
+
+```bash
+python3 eval_imobench.py \
+  --models deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --benchmarks answerbench \
+  --answer-grader-backend math_verify \
+  --output-root ./imobench_runs/answerbench_math_verify
+```
+
+### 4. Paper-faithful GradingBench run with Gemini
 
 ```bash
 export GEMINI_API_KEY='...'
@@ -66,7 +93,7 @@ python3 eval_imobench.py \
   --output-root ./imobench_runs/gradingbench_gemini
 ```
 
-### 3. Local open-source judge comparison on one A100 80G
+### 5. Local open-source judge comparison on one A100 80G
 
 This is the intended Colab-friendly path. Start with `32B` judges, one at a time or sequentially in one job.
 
@@ -92,6 +119,7 @@ The evaluator includes a `ProofAutoGrader`-style path based on the paper’s App
 
 Remaining caveat:
 - the prompt body is close to the paper, but hosted model behavior and some runtime details can still differ from the original authors’ setup
+- judged `ProofBench` rows are checkpointed incrementally, so interrupted runs can resume without losing all completed Gemini grades from the current batch
 
 ### GradingBench
 
