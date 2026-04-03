@@ -26,6 +26,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -53,6 +54,12 @@ DEFAULT_LOCAL_JUDGE_MODELS = [
 ]
 
 FOUR_WAY_LABELS = ("Correct", "Almost", "Partial", "Incorrect")
+BATCH_TERMINAL_STATES = {
+    "JOB_STATE_SUCCEEDED",
+    "JOB_STATE_FAILED",
+    "JOB_STATE_CANCELLED",
+    "JOB_STATE_EXPIRED",
+}
 
 
 def slugify(text: str) -> str:
@@ -135,6 +142,17 @@ def load_jsonl(path: Path) -> List[Dict[str, Any]]:
             if line:
                 rows.append(json.loads(line))
     return rows
+
+
+def write_json(path: Path, payload: Dict[str, Any]) -> None:
+    ensure_dir(path.parent)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def load_json(path: Path) -> Dict[str, Any] | None:
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def existing_ids(path: Path, key: str) -> set[str]:
@@ -352,19 +370,142 @@ class GeminiJudge:
         self.temperature = temperature
         self.top_p = top_p
 
-    def _request(self, prompt: str, response_mime_type: str | None = None) -> str:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
+    def _build_generation_config(self, response_mime_type: str | None = None) -> Dict[str, Any]:
         generation_config: Dict[str, Any] = {
             "temperature": self.temperature,
             "topP": self.top_p,
         }
         if response_mime_type is not None:
             generation_config["responseMimeType"] = response_mime_type
+        return generation_config
 
-        payload = {
+    def _build_text_request(self, prompt: str, response_mime_type: str | None = None) -> Dict[str, Any]:
+        return {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": generation_config,
+            "generationConfig": self._build_generation_config(response_mime_type=response_mime_type),
         }
+
+    @staticmethod
+    def _extract_text_from_generate_response(data: Dict[str, Any]) -> str:
+        candidates = data.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            return ""
+        first_candidate = candidates[0]
+        if not isinstance(first_candidate, dict):
+            return ""
+        content = first_candidate.get("content")
+        if not isinstance(content, dict):
+            return ""
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            return ""
+        return "".join(part.get("text", "") for part in parts if isinstance(part, dict)).strip()
+
+    def _batch_request(
+        self,
+        method: str,
+        path: str,
+        payload: Dict[str, Any] | None = None,
+        *,
+        timeout: int = 60,
+        download: bool = False,
+        alt_media: bool = False,
+    ) -> Any:
+        base_url = "https://generativelanguage.googleapis.com/download/v1beta" if download else "https://generativelanguage.googleapis.com/v1beta"
+        url = f"{base_url}/{path}"
+        if alt_media:
+            url += "?" + urllib.parse.urlencode({"alt": "media"})
+
+        headers = {"x-goog-api-key": self.api_key}
+        data = None
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(payload).encode("utf-8")
+
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+
+        if alt_media:
+            return raw
+        if not raw:
+            return {}
+        return json.loads(raw.decode("utf-8"))
+
+    @staticmethod
+    def batch_state(batch_job: Dict[str, Any]) -> str:
+        metadata = batch_job.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("state"):
+            return str(metadata["state"])
+        if batch_job.get("state"):
+            return str(batch_job["state"])
+        return "JOB_STATE_SUCCEEDED" if batch_job.get("done") else "JOB_STATE_PENDING"
+
+    @staticmethod
+    def batch_inline_responses(batch_job: Dict[str, Any]) -> List[Dict[str, Any]]:
+        response = batch_job.get("response")
+        if isinstance(response, dict):
+            inlined = response.get("inlinedResponses")
+            if isinstance(inlined, list):
+                return [item for item in inlined if isinstance(item, dict)]
+            if isinstance(inlined, dict):
+                nested = inlined.get("inlinedResponses")
+                if isinstance(nested, list):
+                    return [item for item in nested if isinstance(item, dict)]
+        dest = batch_job.get("dest")
+        if isinstance(dest, dict):
+            inlined = dest.get("inlinedResponses")
+            if isinstance(inlined, list):
+                return [item for item in inlined if isinstance(item, dict)]
+            if isinstance(inlined, dict):
+                nested = inlined.get("inlinedResponses")
+                if isinstance(nested, list):
+                    return [item for item in nested if isinstance(item, dict)]
+        return []
+
+    @staticmethod
+    def batch_responses_file(batch_job: Dict[str, Any]) -> str | None:
+        response = batch_job.get("response")
+        if isinstance(response, dict) and response.get("responsesFile"):
+            return str(response["responsesFile"])
+        dest = batch_job.get("dest")
+        if isinstance(dest, dict) and dest.get("fileName"):
+            return str(dest["fileName"])
+        return None
+
+    def create_batch_job(self, requests: Sequence[Dict[str, Any]], display_name: str) -> Dict[str, Any]:
+        payload = {
+            "batch": {
+                "display_name": display_name,
+                "input_config": {
+                    "requests": {
+                        "requests": list(requests),
+                    }
+                },
+            }
+        }
+        return self._batch_request(
+            "POST",
+            f"models/{self.model}:batchGenerateContent",
+            payload=payload,
+            timeout=60,
+        )
+
+    def get_batch_job(self, batch_name: str) -> Dict[str, Any]:
+        return self._batch_request("GET", batch_name, timeout=60)
+
+    def download_batch_result_file(self, file_name: str) -> bytes:
+        return self._batch_request(
+            "GET",
+            f"{file_name}:download",
+            timeout=120,
+            download=True,
+            alt_media=True,
+        )
+
+    def _request(self, prompt: str, response_mime_type: str | None = None) -> str:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
+        payload = self._build_text_request(prompt, response_mime_type=response_mime_type)
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
 
@@ -373,8 +514,7 @@ class GeminiJudge:
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
-                parts = data["candidates"][0]["content"]["parts"]
-                return "".join(part.get("text", "") for part in parts).strip()
+                return self._extract_text_from_generate_response(data)
             except Exception as err:  # noqa: BLE001
                 last_err = err
                 if attempt < self.retries:
@@ -480,15 +620,14 @@ Golden Answer: {golden_answer}
             "judge_response": response,
         }
 
-    def judge_proof(
+    def _build_proof_prompt(
         self,
-        problem_id: str,
         problem: str,
         candidate_solution: str,
         reference_solution: str,
         grading_guidelines: str,
-    ) -> Dict[str, Any]:
-        prompt = f"""
+    ) -> str:
+        return f"""
 You are an expert grader for the International Mathematics Olympiad
 (IMO). Your task is to evaluate a proposed solution strictly and
 rigorously. Keep in mind the standards at the IMO are extremely
@@ -570,7 +709,23 @@ present your final score in the format below.
 <points>0 out of 7</points>
 """.strip()
 
-        response = self._call_text(prompt)
+    def build_proof_request(
+        self,
+        problem: str,
+        candidate_solution: str,
+        reference_solution: str,
+        grading_guidelines: str,
+    ) -> Dict[str, Any]:
+        return self._build_text_request(
+            self._build_proof_prompt(
+                problem=problem,
+                candidate_solution=candidate_solution,
+                reference_solution=reference_solution,
+                grading_guidelines=grading_guidelines,
+            )
+        )
+
+    def _proof_grade_from_response_text(self, response: str) -> Dict[str, Any]:
         score = self._extract_points_score(response)
         if score is None:
             raise RuntimeError("ProofAutoGrader response did not contain a parseable <points> score.")
@@ -579,6 +734,24 @@ present your final score in the format below.
             "label_4way": points_to_label(score),
             "judge_response": response,
         }
+
+    def judge_proof(
+        self,
+        problem_id: str,
+        problem: str,
+        candidate_solution: str,
+        reference_solution: str,
+        grading_guidelines: str,
+    ) -> Dict[str, Any]:
+        del problem_id
+        prompt = self._build_proof_prompt(
+            problem=problem,
+            candidate_solution=candidate_solution,
+            reference_solution=reference_solution,
+            grading_guidelines=grading_guidelines,
+        )
+        response = self._call_text(prompt)
+        return self._proof_grade_from_response_text(response)
 
 
 class MathVerifyAnswerJudge:
@@ -1150,7 +1323,9 @@ def run_proofbench(
     judged_path: Path,
     max_new_tokens: int,
     batch_size: int,
+    judge_mode: str = "realtime",
     judge_concurrency: int = 1,
+    batch_poll_seconds: int = 30,
 ) -> List[Dict[str, Any]]:
     pred_done = existing_ids(prediction_path, "problem_id")
     pending_predictions = [row for row in rows if row["Problem ID"] not in pred_done]
@@ -1184,6 +1359,226 @@ def run_proofbench(
     pending_judged = [row for row in predictions if row["problem_id"] not in judged_done]
     if pending_judged:
         error_path = judged_path.with_name("proofbench_judge_errors.jsonl")
+        batch_job_path = judged_path.with_name("proofbench_batch_job.json")
+
+        def render_batch_error(error_payload: Any) -> str:
+            if isinstance(error_payload, str):
+                return error_payload
+            try:
+                return json.dumps(error_payload, ensure_ascii=False, sort_keys=True)
+            except TypeError:
+                return str(error_payload)
+
+        def inline_response_key(item: Dict[str, Any]) -> str | None:
+            metadata = item.get("metadata")
+            if isinstance(metadata, dict) and metadata.get("key") is not None:
+                return str(metadata["key"])
+            if item.get("key") is not None:
+                return str(item["key"])
+            return None
+
+        def batch_display_name(rows_for_batch: Sequence[Dict[str, Any]]) -> str:
+            digest_source = "\n".join(
+                [judge.model, model_name, *(str(row["problem_id"]) for row in rows_for_batch)]
+            ).encode("utf-8")
+            digest = hashlib.sha1(digest_source).hexdigest()[:12]
+            return f"proofbench-{slugify(model_name)[:32]}-{digest}"
+
+        if judge_mode == "batch":
+            pending_by_problem_id = {str(row["problem_id"]): row for row in pending_judged}
+            current_pending_ids = list(pending_by_problem_id.keys())
+            manifest = load_json(batch_job_path)
+            batch_job: Dict[str, Any] | None = None
+            submitted_ids: List[str] = []
+
+            if manifest is not None:
+                submitted_ids = [str(problem_id) for problem_id in manifest.get("submitted_problem_ids", [])]
+                batch_name = str(manifest.get("batch_name", "")).strip()
+                submitted_id_set = set(submitted_ids)
+                current_id_set = set(current_pending_ids)
+
+                if batch_name and current_id_set.issubset(submitted_id_set):
+                    batch_job = judge.get_batch_job(batch_name)
+                    manifest["last_state"] = judge.batch_state(batch_job)
+                    manifest["last_checked_at"] = datetime.now().isoformat()
+                    write_json(batch_job_path, manifest)
+                elif not batch_name:
+                    manifest = None
+                else:
+                    previous_state = str(manifest.get("last_state", ""))
+                    if previous_state and previous_state not in BATCH_TERMINAL_STATES:
+                        raise RuntimeError(
+                            "Existing active ProofBench batch job does not match the current pending proof set. "
+                            f"Inspect {batch_job_path} before submitting another batch."
+                        )
+                    manifest = None
+
+            if manifest is None or batch_job is None:
+                request_plan = [{"key": str(row["problem_id"]), "problem_id": str(row["problem_id"])} for row in pending_judged]
+                created_batch = judge.create_batch_job(
+                    requests=[
+                        {
+                            "request": judge.build_proof_request(
+                                problem=row["problem"],
+                                candidate_solution=row["output"],
+                                reference_solution=row["reference_solution"],
+                                grading_guidelines=row["grading_guidelines"],
+                            ),
+                            "metadata": {"key": str(row["problem_id"])},
+                        }
+                        for row in pending_judged
+                    ],
+                    display_name=batch_display_name(pending_judged),
+                )
+                batch_name = str(created_batch.get("name", "")).strip()
+                if not batch_name:
+                    raise RuntimeError("Gemini Batch API did not return a batch job name.")
+                manifest = {
+                    "backend": "gemini_batch",
+                    "benchmark": "proofbench",
+                    "judge_model": judge.model,
+                    "solver_model": model_name,
+                    "batch_name": batch_name,
+                    "display_name": batch_display_name(pending_judged),
+                    "submitted_problem_ids": current_pending_ids,
+                    "requests": request_plan,
+                    "created_at": datetime.now().isoformat(),
+                    "last_checked_at": datetime.now().isoformat(),
+                    "last_state": judge.batch_state(created_batch),
+                }
+                write_json(batch_job_path, manifest)
+                batch_job = created_batch
+            else:
+                request_plan = [
+                    {
+                        "key": str(item.get("key", item.get("problem_id", ""))),
+                        "problem_id": str(item.get("problem_id", item.get("key", ""))),
+                    }
+                    for item in manifest.get("requests", [])
+                    if item.get("problem_id") or item.get("key")
+                ]
+
+            batch_name = str(manifest["batch_name"])
+            while judge.batch_state(batch_job) not in BATCH_TERMINAL_STATES:
+                current_state = judge.batch_state(batch_job)
+                print(f"[ProofBench] Waiting on Gemini batch {batch_name}: {current_state}", file=sys.stderr)
+                time.sleep(max(1, batch_poll_seconds))
+                batch_job = judge.get_batch_job(batch_name)
+                manifest["last_state"] = judge.batch_state(batch_job)
+                manifest["last_checked_at"] = datetime.now().isoformat()
+                write_json(batch_job_path, manifest)
+
+            final_state = judge.batch_state(batch_job)
+            manifest["last_state"] = final_state
+            manifest["last_checked_at"] = datetime.now().isoformat()
+
+            if final_state != "JOB_STATE_SUCCEEDED":
+                manifest["error"] = batch_job.get("error")
+                write_json(batch_job_path, manifest)
+                raise RuntimeError(
+                    f"Gemini ProofBench batch {batch_name} finished with state {final_state}: "
+                    f"{render_batch_error(batch_job.get('error'))}"
+                )
+
+            inline_results = judge.batch_inline_responses(batch_job)
+            if not inline_results:
+                responses_file = judge.batch_responses_file(batch_job)
+                if responses_file:
+                    file_content = judge.download_batch_result_file(responses_file).decode("utf-8")
+                    inline_results = [json.loads(line) for line in file_content.splitlines() if line.strip()]
+                else:
+                    raise RuntimeError(
+                        f"Gemini ProofBench batch {batch_name} succeeded but returned no inline responses or result file."
+                    )
+
+            request_order = [str(item["key"]) for item in request_plan if item.get("key")]
+            result_by_key: Dict[str, Dict[str, Any]] = {}
+            for idx, result in enumerate(inline_results):
+                key = inline_response_key(result)
+                if key is None and idx < len(request_order):
+                    key = request_order[idx]
+                if key is not None:
+                    result_by_key[key] = result
+
+            judged_rows: List[Dict[str, Any]] = []
+            error_rows: List[Dict[str, Any]] = []
+            for request_item in request_plan:
+                key = str(request_item["key"])
+                problem_id = str(request_item["problem_id"])
+                row = pending_by_problem_id.get(problem_id)
+                if row is None:
+                    continue
+
+                result = result_by_key.get(key)
+                if result is None:
+                    error_rows.append(
+                        {
+                            **row,
+                            "judge_error": "Gemini batch completed without returning a result for this proof.",
+                            "error_type": "MissingBatchResult",
+                            "batch_request_key": key,
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                    )
+                    continue
+
+                if result.get("error") is not None:
+                    error_rows.append(
+                        {
+                            **row,
+                            "judge_error": render_batch_error(result.get("error")),
+                            "error_type": "BatchRequestError",
+                            "batch_request_key": key,
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                    )
+                    continue
+
+                response_payload = result.get("response")
+                if not isinstance(response_payload, dict) and isinstance(result.get("candidates"), list):
+                    response_payload = result
+                if not isinstance(response_payload, dict):
+                    error_rows.append(
+                        {
+                            **row,
+                            "judge_error": "Gemini batch result did not include a GenerateContent response payload.",
+                            "error_type": "MissingBatchResponse",
+                            "batch_request_key": key,
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                    )
+                    continue
+
+                try:
+                    response_text = judge._extract_text_from_generate_response(response_payload)
+                    if not response_text:
+                        raise RuntimeError("Gemini batch result contained no text response.")
+                    grade = judge._proof_grade_from_response_text(response_text)
+                except Exception as err:  # noqa: BLE001
+                    error_rows.append(
+                        {
+                            **row,
+                            "judge_error": str(err),
+                            "error_type": type(err).__name__,
+                            "batch_request_key": key,
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                    )
+                    continue
+
+                judged_rows.append({**row, **grade})
+
+            if judged_rows:
+                append_jsonl(judged_path, judged_rows)
+            if error_rows:
+                append_jsonl(error_path, error_rows)
+
+            manifest["result_applied_at"] = datetime.now().isoformat()
+            manifest["judged_row_count"] = len(judged_rows)
+            manifest["error_row_count"] = len(error_rows)
+            write_json(batch_job_path, manifest)
+            return load_jsonl(judged_path)
+
         max_workers = max(1, judge_concurrency)
 
         def judge_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -1344,10 +1739,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gemini-timeout", type=int, default=600, help="Per-request Gemini read timeout in seconds.")
     parser.add_argument("--gemini-retries", type=int, default=5, help="Number of retries for Gemini API requests.")
     parser.add_argument(
+        "--proof-judge-mode",
+        choices=("realtime", "batch"),
+        default="realtime",
+        help="ProofBench Gemini judging mode. Use batch to submit one Gemini Batch API job per model and poll for completion.",
+    )
+    parser.add_argument(
         "--judge-concurrency",
         type=int,
         default=1,
-        help="Concurrent ProofBench judge requests to run in parallel. Defaults to 1 for sequential grading.",
+        help="Concurrent realtime ProofBench judge requests to run in parallel. Ignored when --proof-judge-mode=batch.",
+    )
+    parser.add_argument(
+        "--batch-poll-seconds",
+        type=int,
+        default=30,
+        help="Polling interval in seconds while waiting for a Gemini Batch API ProofBench job to finish.",
     )
     parser.add_argument(
         "--judge-backend",
@@ -1467,7 +1874,9 @@ def main() -> int:
                 judged_path=model_dir / "proofbench_judged.jsonl",
                 max_new_tokens=args.proof_max_new_tokens,
                 batch_size=args.batch_size,
+                judge_mode=args.proof_judge_mode,
                 judge_concurrency=args.judge_concurrency,
+                batch_poll_seconds=args.batch_poll_seconds,
             )
             summary["proofbench"] = summarize_proofbench(proof_rows)
 

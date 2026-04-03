@@ -93,11 +93,29 @@ python3 eval_imobench.py \
   --output-root ./imobench_runs/gradingbench_gemini
 ```
 
-### 5. ProofBench run with concurrent Gemini judging
+### 5. ProofBench run with Gemini Batch API
 
-If you already have `proofbench_predictions.jsonl` and only need the judging
-pass, the evaluator can resume from the existing predictions and issue several
-Gemini grading requests in parallel.
+This is the recommended path for full `ProofBench` judging. The evaluator
+submits one Gemini Batch API job per solver model, stores the batch metadata in
+`proofbench_batch_job.json`, and polls the same batch on reruns instead of
+blindly resubmitting another set of requests.
+
+```bash
+export GEMINI_API_KEY='...'
+python3 eval_imobench.py \
+  --models deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B hbx/JustRL-DeepSeek-1.5B \
+  --benchmarks proofbench \
+  --gemini-model gemini-2.5-pro \
+  --proof-judge-mode batch \
+  --batch-poll-seconds 30 \
+  --output-root ./imobench_runs/proofbench_gemini_20260403
+```
+
+### 6. ProofBench realtime fallback with concurrent Gemini judging
+
+If you prefer the older live-request path, the evaluator can still resume from
+existing `proofbench_predictions.jsonl` files and grade several proofs in
+parallel.
 
 ```bash
 export GEMINI_API_KEY='...'
@@ -107,11 +125,12 @@ python3 eval_imobench.py \
   --gemini-model gemini-2.5-pro \
   --gemini-timeout 600 \
   --gemini-retries 5 \
+  --proof-judge-mode realtime \
   --judge-concurrency 4 \
   --output-root ./imobench_runs/proofbench_gemini_20260403
 ```
 
-### 6. Local open-source judge comparison on one A100 80G
+### 7. Local open-source judge comparison on one A100 80G
 
 This is the intended Colab-friendly path. Start with `32B` judges, one at a time or sequentially in one job.
 
@@ -137,7 +156,7 @@ The evaluator includes a `ProofAutoGrader`-style path based on the paper’s App
 
 Remaining caveat:
 - the prompt body is close to the paper, but hosted model behavior and some runtime details can still differ from the original authors’ setup
-- judged `ProofBench` rows are checkpointed incrementally, so interrupted runs can resume without losing all completed Gemini grades from the current batch
+- judged `ProofBench` rows are checkpointed incrementally in realtime mode, and batch-mode runs persist `proofbench_batch_job.json` so reruns can poll the same Gemini batch job instead of resubmitting it
 
 ### GradingBench
 
