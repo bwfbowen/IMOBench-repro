@@ -64,6 +64,10 @@ BATCH_TERMINAL_STATES = {
     "BATCH_STATE_CANCELLED",
     "BATCH_STATE_EXPIRED",
 }
+BATCH_SUCCESS_STATES = {
+    "JOB_STATE_SUCCEEDED",
+    "BATCH_STATE_SUCCEEDED",
+}
 
 
 def slugify(text: str) -> str:
@@ -1476,7 +1480,7 @@ def run_proofbench(
             manifest["last_state"] = final_state
             manifest["last_checked_at"] = datetime.now().isoformat()
 
-            if final_state != "JOB_STATE_SUCCEEDED":
+            if final_state not in BATCH_SUCCESS_STATES:
                 manifest["error"] = batch_job.get("error")
                 write_json(batch_job_path, manifest)
                 raise RuntimeError(
