@@ -339,8 +339,8 @@ class GeminiJudge:
         self,
         api_key: str,
         model: str,
-        timeout: int = 120,
-        retries: int = 3,
+        timeout: int = 600,
+        retries: int = 5,
         temperature: float = 0.0,
         top_p: float = 1.0,
     ) -> None:
@@ -1181,14 +1181,33 @@ def run_proofbench(
     judged_done = existing_ids(judged_path, "problem_id")
     pending_judged = [row for row in predictions if row["problem_id"] not in judged_done]
     if pending_judged:
+        error_path = judged_path.with_name("proofbench_judge_errors.jsonl")
         for row in pending_judged:
-            grade = judge.judge_proof(
-                problem_id=row["problem_id"],
-                problem=row["problem"],
-                candidate_solution=row["output"],
-                reference_solution=row["reference_solution"],
-                grading_guidelines=row["grading_guidelines"],
-            )
+            try:
+                grade = judge.judge_proof(
+                    problem_id=row["problem_id"],
+                    problem=row["problem"],
+                    candidate_solution=row["output"],
+                    reference_solution=row["reference_solution"],
+                    grading_guidelines=row["grading_guidelines"],
+                )
+            except Exception as err:  # noqa: BLE001
+                append_jsonl(
+                    error_path,
+                    [
+                        {
+                            **row,
+                            "judge_error": str(err),
+                            "error_type": type(err).__name__,
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                    ],
+                )
+                print(
+                    f"[ProofBench] Judge failed for {row['problem_id']}: {err}",
+                    file=sys.stderr,
+                )
+                continue
             append_jsonl(judged_path, [{**row, **grade}])
     return load_jsonl(judged_path)
 
@@ -1289,6 +1308,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradingbench-seed", type=int, default=0, help="Seed for stratified GradingBench sampling.")
     parser.add_argument("--gemini-model", default="gemini-2.5-pro")
     parser.add_argument("--gemini-api-env", default="GEMINI_API_KEY")
+    parser.add_argument("--gemini-timeout", type=int, default=600, help="Per-request Gemini read timeout in seconds.")
+    parser.add_argument("--gemini-retries", type=int, default=5, help="Number of retries for Gemini API requests.")
     parser.add_argument(
         "--judge-backend",
         choices=("gemini", "local_hf"),
@@ -1357,6 +1378,8 @@ def main() -> int:
                     answer_judge = GeminiJudge(
                         api_key=gemini_key,
                         model=args.gemini_model,
+                        timeout=args.gemini_timeout,
+                        retries=args.gemini_retries,
                         temperature=args.judge_temperature,
                         top_p=args.judge_top_p,
                     )
@@ -1387,6 +1410,8 @@ def main() -> int:
                 proof_judge = GeminiJudge(
                     api_key=gemini_key,
                     model=args.gemini_model,
+                    timeout=args.gemini_timeout,
+                    retries=args.gemini_retries,
                     temperature=args.judge_temperature,
                     top_p=args.judge_top_p,
                 )
