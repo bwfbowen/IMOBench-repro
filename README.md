@@ -93,7 +93,25 @@ python3 eval_imobench.py \
   --output-root ./imobench_runs/gradingbench_gemini
 ```
 
-### 5. Local open-source judge comparison on one A100 80G
+### 5. ProofBench run with concurrent Gemini judging
+
+If you already have `proofbench_predictions.jsonl` and only need the judging
+pass, the evaluator can resume from the existing predictions and issue several
+Gemini grading requests in parallel.
+
+```bash
+export GEMINI_API_KEY='...'
+python3 eval_imobench.py \
+  --models deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B hbx/JustRL-DeepSeek-1.5B \
+  --benchmarks proofbench \
+  --gemini-model gemini-2.5-pro \
+  --gemini-timeout 600 \
+  --gemini-retries 5 \
+  --judge-concurrency 4 \
+  --output-root ./imobench_runs/proofbench_gemini_20260403
+```
+
+### 6. Local open-source judge comparison on one A100 80G
 
 This is the intended Colab-friendly path. Start with `32B` judges, one at a time or sequentially in one job.
 

@@ -28,6 +28,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1149,6 +1150,7 @@ def run_proofbench(
     judged_path: Path,
     max_new_tokens: int,
     batch_size: int,
+    judge_concurrency: int = 1,
 ) -> List[Dict[str, Any]]:
     pred_done = existing_ids(prediction_path, "problem_id")
     pending_predictions = [row for row in rows if row["Problem ID"] not in pred_done]
@@ -1182,33 +1184,64 @@ def run_proofbench(
     pending_judged = [row for row in predictions if row["problem_id"] not in judged_done]
     if pending_judged:
         error_path = judged_path.with_name("proofbench_judge_errors.jsonl")
-        for row in pending_judged:
-            try:
-                grade = judge.judge_proof(
-                    problem_id=row["problem_id"],
-                    problem=row["problem"],
-                    candidate_solution=row["output"],
-                    reference_solution=row["reference_solution"],
-                    grading_guidelines=row["grading_guidelines"],
-                )
-            except Exception as err:  # noqa: BLE001
-                append_jsonl(
-                    error_path,
-                    [
-                        {
-                            **row,
-                            "judge_error": str(err),
-                            "error_type": type(err).__name__,
-                            "timestamp": datetime.now().isoformat(),
-                        }
-                    ],
-                )
-                print(
-                    f"[ProofBench] Judge failed for {row['problem_id']}: {err}",
-                    file=sys.stderr,
-                )
-                continue
-            append_jsonl(judged_path, [{**row, **grade}])
+        max_workers = max(1, judge_concurrency)
+
+        def judge_row(row: Dict[str, Any]) -> Dict[str, Any]:
+            return judge.judge_proof(
+                problem_id=row["problem_id"],
+                problem=row["problem"],
+                candidate_solution=row["output"],
+                reference_solution=row["reference_solution"],
+                grading_guidelines=row["grading_guidelines"],
+            )
+
+        if max_workers == 1:
+            for row in pending_judged:
+                try:
+                    grade = judge_row(row)
+                except Exception as err:  # noqa: BLE001
+                    append_jsonl(
+                        error_path,
+                        [
+                            {
+                                **row,
+                                "judge_error": str(err),
+                                "error_type": type(err).__name__,
+                                "timestamp": datetime.now().isoformat(),
+                            }
+                        ],
+                    )
+                    print(
+                        f"[ProofBench] Judge failed for {row['problem_id']}: {err}",
+                        file=sys.stderr,
+                    )
+                    continue
+                append_jsonl(judged_path, [{**row, **grade}])
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_row = {executor.submit(judge_row, row): row for row in pending_judged}
+                for future in as_completed(future_to_row):
+                    row = future_to_row[future]
+                    try:
+                        grade = future.result()
+                    except Exception as err:  # noqa: BLE001
+                        append_jsonl(
+                            error_path,
+                            [
+                                {
+                                    **row,
+                                    "judge_error": str(err),
+                                    "error_type": type(err).__name__,
+                                    "timestamp": datetime.now().isoformat(),
+                                }
+                            ],
+                        )
+                        print(
+                            f"[ProofBench] Judge failed for {row['problem_id']}: {err}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    append_jsonl(judged_path, [{**row, **grade}])
     return load_jsonl(judged_path)
 
 
@@ -1310,6 +1343,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gemini-api-env", default="GEMINI_API_KEY")
     parser.add_argument("--gemini-timeout", type=int, default=600, help="Per-request Gemini read timeout in seconds.")
     parser.add_argument("--gemini-retries", type=int, default=5, help="Number of retries for Gemini API requests.")
+    parser.add_argument(
+        "--judge-concurrency",
+        type=int,
+        default=1,
+        help="Concurrent ProofBench judge requests to run in parallel. Defaults to 1 for sequential grading.",
+    )
     parser.add_argument(
         "--judge-backend",
         choices=("gemini", "local_hf"),
@@ -1428,6 +1467,7 @@ def main() -> int:
                 judged_path=model_dir / "proofbench_judged.jsonl",
                 max_new_tokens=args.proof_max_new_tokens,
                 batch_size=args.batch_size,
+                judge_concurrency=args.judge_concurrency,
             )
             summary["proofbench"] = summarize_proofbench(proof_rows)
 
