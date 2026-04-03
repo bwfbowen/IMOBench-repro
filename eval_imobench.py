@@ -1400,6 +1400,18 @@ def run_proofbench(
             submitted_ids: List[str] = []
 
             if manifest is not None:
+                manifest_backend = str(manifest.get("backend", "")).strip()
+                manifest_judge_model = str(manifest.get("judge_model", "")).strip()
+                manifest_solver_model = str(manifest.get("solver_model", "")).strip()
+                if (
+                    manifest_backend != "gemini_batch"
+                    or manifest_judge_model != judge.model
+                    or manifest_solver_model != model_name
+                ):
+                    raise RuntimeError(
+                        "Existing ProofBench batch manifest targets a different backend or model combination. "
+                        f"Use a fresh output root or remove {batch_job_path} before switching judge models."
+                    )
                 submitted_ids = [str(problem_id) for problem_id in manifest.get("submitted_problem_ids", [])]
                 batch_name = str(manifest.get("batch_name", "")).strip()
                 submitted_id_set = set(submitted_ids)
