@@ -15,6 +15,7 @@ Default comparison pair:
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import hashlib
 import io
@@ -315,6 +316,27 @@ class HFGenerator:
             return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         return prompt
 
+    def _generation_config_for_call(
+        self,
+        do_sample: bool,
+        temperature: float,
+        top_p: float,
+    ) -> Any | None:
+        generation_config = getattr(self.model, "generation_config", None)
+        if generation_config is None:
+            return None
+        generation_config = copy.deepcopy(generation_config)
+        generation_config.do_sample = bool(do_sample)
+        if do_sample:
+            generation_config.temperature = temperature
+            generation_config.top_p = top_p
+        else:
+            # Some pretrained models ship sampling-only flags in generation_config.json.
+            # Reset them for deterministic decoding so transformers does not warn.
+            generation_config.temperature = 1.0
+            generation_config.top_p = 1.0
+        return generation_config
+
     def generate(
         self,
         prompts: Sequence[str],
@@ -343,13 +365,21 @@ class HFGenerator:
                 generate_kwargs: Dict[str, Any] = {
                     **enc,
                     "max_new_tokens": max_new_tokens,
-                    "do_sample": do_sample,
                     "pad_token_id": self.tokenizer.pad_token_id,
                     "eos_token_id": self.tokenizer.eos_token_id,
                 }
-                if do_sample:
-                    generate_kwargs["temperature"] = temperature
-                    generate_kwargs["top_p"] = top_p
+                generation_config = self._generation_config_for_call(
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+                if generation_config is not None:
+                    generate_kwargs["generation_config"] = generation_config
+                else:
+                    generate_kwargs["do_sample"] = do_sample
+                    if do_sample:
+                        generate_kwargs["temperature"] = temperature
+                        generate_kwargs["top_p"] = top_p
 
                 generated = self.model.generate(**generate_kwargs)
 
