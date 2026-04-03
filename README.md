@@ -144,6 +144,22 @@ python3 eval_imobench.py \
   --output-root ./imobench_runs/gradingbench_local32b
 ```
 
+If you have `vllm` installed, you can switch the local runtime and batch GradingBench prompts:
+
+```bash
+python3 eval_imobench.py \
+  --benchmarks gradingbench \
+  --judge-backend local_hf \
+  --local-engine vllm \
+  --judge-batch-size 8 \
+  --judge-models-csv "unsloth/gemma-3-27b-it-bnb-4bit" \
+  --output-root ./imobench_runs/gradingbench_gemma3_27b_vllm
+```
+
+Notes:
+- `vllm` is optional and is not installed by `requirements.txt`.
+- On consumer GPUs, prefer setting `CUDA_VISIBLE_DEVICES` and keep `--vllm-max-model-len` capped to the task you are actually running instead of the model's full context window.
+
 ## Reproduction Notes
 
 ### ProofAutoGrader

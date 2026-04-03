@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Protocol, Sequence
 
 os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
 
@@ -202,6 +202,13 @@ def slurm_gpu_allocated() -> bool:
     return bool(visible and visible not in {"NoDevFiles", "-1"})
 
 
+def visible_gpu_count() -> int:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not visible or visible in {"NoDevFiles", "-1"}:
+        return 0
+    return len([gpu for gpu in visible.split(",") if gpu.strip()])
+
+
 def proofbench_split(problem_id: str) -> str:
     if problem_id.startswith("PB-Basic-"):
         return "basic"
@@ -259,6 +266,33 @@ def proof_prompt(problem: str) -> str:
         "Provide a rigorous and complete proof.\n\n"
         f"Problem:\n{problem}\n"
     )
+
+
+def gradingbench_prompt(problem: str, proposed_solution: str) -> str:
+    return f"""
+Carefully analyze the given problem statement and the proposed solution, and then write
+out your analysis regarding the correctness of the proposed solution.
+After the analysis, you must provide a score based on the following criteria:
+• incorrect: The solution is completely incorrect or irrelevant.
+• partial: The solution is partially correct but has significant errors or omissions.
+• almost: The solution is almost correct but contains minor errors or inaccuracies.
+• correct: The solution is fully correct and complete.
+The very last part of your response must be only one of the following words: incorrect,
+partial, almost, or correct.
+Problem:{problem} Solution:{proposed_solution}
+""".strip()
+
+
+class TextGenerator(Protocol):
+    def generate(
+        self,
+        prompts: Sequence[str],
+        max_new_tokens: int,
+        batch_size: int = 1,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+    ) -> List[str]: ...
 
 
 @dataclass
@@ -389,6 +423,123 @@ class HFGenerator:
                     outputs.append(self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip())
 
         return outputs
+
+
+@dataclass
+class VLLMGenerator:
+    model_name: str
+    max_input_length: int = 8192
+    trust_remote_code: bool = False
+    max_model_len: int | None = None
+    gpu_memory_utilization: float = 0.9
+
+    def __post_init__(self) -> None:
+        from transformers import AutoTokenizer
+
+        try:
+            from vllm import LLM
+        except ImportError as err:  # noqa: BLE001
+            raise RuntimeError(
+                "vLLM local engine requested, but the 'vllm' package is not installed. "
+                "Install it in a separate environment or this one, keeping in mind it may replace "
+                "the current torch/transformers versions."
+            ) from err
+
+        if not slurm_gpu_allocated():
+            raise RuntimeError(
+                "vLLM local engine requires CUDA_VISIBLE_DEVICES to point at one or more GPUs."
+            )
+
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=self.trust_remote_code)
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        llm_kwargs: Dict[str, Any] = {
+            "model": self.model_name,
+            "trust_remote_code": self.trust_remote_code,
+            "dtype": "bfloat16",
+            "gpu_memory_utilization": self.gpu_memory_utilization,
+        }
+        if self.max_model_len:
+            llm_kwargs["max_model_len"] = self.max_model_len
+        gpu_count = visible_gpu_count()
+        if gpu_count > 1:
+            llm_kwargs["tensor_parallel_size"] = gpu_count
+
+        self.llm = LLM(**llm_kwargs)
+
+    def _render_prompt(self, prompt: str) -> str:
+        if getattr(self.tokenizer, "chat_template", None):
+            messages = [{"role": "user", "content": prompt}]
+            return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        return prompt
+
+    def generate(
+        self,
+        prompts: Sequence[str],
+        max_new_tokens: int,
+        batch_size: int = 1,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+    ) -> List[str]:
+        from vllm import SamplingParams
+
+        rendered_prompts = [self._render_prompt(prompt) for prompt in prompts]
+        outputs: List[str] = []
+        sampling_params = SamplingParams(
+            max_tokens=max_new_tokens,
+            temperature=temperature if do_sample else 0.0,
+            top_p=top_p if do_sample else 1.0,
+            skip_special_tokens=True,
+        )
+        for prompt_batch in split_batches(rendered_prompts, batch_size):
+            generated = self.llm.generate(list(prompt_batch), sampling_params, use_tqdm=False)
+            for request_output in generated:
+                candidates = getattr(request_output, "outputs", None) or []
+                if not candidates:
+                    outputs.append("")
+                    continue
+                outputs.append(candidates[0].text.strip())
+        return outputs
+
+
+def resolve_local_max_model_len(
+    max_input_length: int,
+    max_new_tokens: int,
+    explicit_max_model_len: int = 0,
+) -> int | None:
+    if explicit_max_model_len > 0:
+        return explicit_max_model_len
+    if max_input_length <= 0 or max_new_tokens <= 0:
+        return None
+    return max_input_length + max_new_tokens
+
+
+def build_local_generator(
+    *,
+    engine: str,
+    model_name: str,
+    max_input_length: int,
+    trust_remote_code: bool,
+    max_model_len: int | None = None,
+    vllm_gpu_memory_utilization: float = 0.9,
+) -> TextGenerator:
+    if engine == "transformers":
+        return HFGenerator(
+            model_name=model_name,
+            max_input_length=max_input_length,
+            trust_remote_code=trust_remote_code,
+        )
+    if engine == "vllm":
+        return VLLMGenerator(
+            model_name=model_name,
+            max_input_length=max_input_length,
+            trust_remote_code=trust_remote_code,
+            max_model_len=max_model_len,
+            gpu_memory_utilization=vllm_gpu_memory_utilization,
+        )
+    raise ValueError(f"Unknown local engine: {engine}")
 
 
 class GeminiJudge:
@@ -1079,20 +1230,11 @@ Below is the response:
         problem: str,
         proposed_solution: str,
     ) -> Dict[str, Any]:
-        prompt = f"""
-Carefully analyze the given problem statement and the proposed solution, and then write
-out your analysis regarding the correctness of the proposed solution.
-After the analysis, you must provide a score based on the following criteria:
-• incorrect: The solution is completely incorrect or irrelevant.
-• partial: The solution is partially correct but has significant errors or omissions.
-• almost: The solution is almost correct but contains minor errors or inaccuracies.
-• correct: The solution is fully correct and complete.
-The very last part of your response must be only one of the following words: incorrect,
-partial, almost, or correct.
-Problem:{problem} Solution:{proposed_solution}
-""".strip()
-
+        prompt = gradingbench_prompt(problem=problem, proposed_solution=proposed_solution)
         response = self._call_text(prompt)
+        return self._parse_gradingbench_response(response)
+
+    def _parse_gradingbench_response(self, response: str) -> Dict[str, Any]:
         label = self._extract_label_from_text(response)
         if label is None:
             label = self.extract_gradingbench_label(response)
@@ -1113,23 +1255,48 @@ class LocalHFJudge(GeminiJudge):
         max_input_length: int = 8192,
         max_new_tokens: int = 256,
         trust_remote_code: bool = False,
+        engine: str = "transformers",
+        batch_size: int = 1,
+        vllm_max_model_len: int = 0,
+        vllm_gpu_memory_utilization: float = 0.9,
     ) -> None:
         self.model = model_name
         self.max_new_tokens = max_new_tokens
-        self.generator = HFGenerator(
+        self.batch_size = max(1, batch_size)
+        self.generator = build_local_generator(
+            engine=engine,
             model_name=model_name,
             max_input_length=max_input_length,
             trust_remote_code=trust_remote_code,
+            max_model_len=resolve_local_max_model_len(
+                max_input_length=max_input_length,
+                max_new_tokens=max_new_tokens,
+                explicit_max_model_len=vllm_max_model_len,
+            ),
+            vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
         )
 
     def _call_text(self, prompt: str) -> str:
         outputs = self.generator.generate(
             [prompt],
             max_new_tokens=self.max_new_tokens,
-            batch_size=1,
+            batch_size=self.batch_size,
             do_sample=False,
         )
         return outputs[0]
+
+    def judge_gradingbench_batch(self, rows: Sequence[Dict[str, str]]) -> List[Dict[str, Any]]:
+        prompts = [
+            gradingbench_prompt(problem=row["Problem"], proposed_solution=row["Response"])
+            for row in rows
+        ]
+        outputs = self.generator.generate(
+            prompts,
+            max_new_tokens=self.max_new_tokens,
+            batch_size=self.batch_size,
+            do_sample=False,
+        )
+        return [self._parse_gradingbench_response(output) for output in outputs]
 
 
 def summarize_answerbench(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1296,7 +1463,7 @@ def save_summary_json_csv(path_prefix: Path, summary: Dict[str, Any]) -> None:
 
 def run_answerbench(
     model_name: str,
-    generator: HFGenerator,
+    generator: TextGenerator,
     judge: Any,
     rows: Sequence[Dict[str, str]],
     output_path: Path,
@@ -1354,7 +1521,7 @@ def run_answerbench(
 
 def run_proofbench(
     model_name: str,
-    generator: HFGenerator | None,
+    generator: TextGenerator | None,
     judge: GeminiJudge,
     rows: Sequence[Dict[str, str]],
     prediction_path: Path,
@@ -1698,28 +1865,50 @@ def run_gradingbench(
     done = existing_ids(output_path, "grading_id")
     pending = [row for row in rows if row["Grading ID"] not in done]
     if pending:
-        judged_rows = []
-        for row in pending:
-            grade = judge.judge_gradingbench(
-                grading_id=row["Grading ID"],
-                problem_id=row["Problem ID"],
-                problem=row["Problem"],
-                proposed_solution=row["Response"],
-            )
-            judged_rows.append(
-                {
-                    "benchmark": "gradingbench",
-                    "grading_id": row["Grading ID"],
-                    "problem_id": row["Problem ID"],
-                    "problem_source": row["Problem Source"],
-                    "gold_points": safe_int(row["Points"]),
-                    "gold_label_4way": row["Reward"],
-                    "pred_points": grade["score_0_7"],
-                    "pred_label_4way": grade["label_4way"],
-                    "judge_response": grade["judge_response"],
-                }
-            )
-        append_jsonl(output_path, judged_rows)
+        batch_judge = getattr(judge, "judge_gradingbench_batch", None)
+        if callable(batch_judge):
+            batch_size = max(1, safe_int(getattr(judge, "batch_size", 1), default=1))
+            for row_batch in split_batches(pending, batch_size):
+                judged_rows = []
+                grades = batch_judge(row_batch)
+                for row, grade in zip(row_batch, grades):
+                    judged_rows.append(
+                        {
+                            "benchmark": "gradingbench",
+                            "grading_id": row["Grading ID"],
+                            "problem_id": row["Problem ID"],
+                            "problem_source": row["Problem Source"],
+                            "gold_points": safe_int(row["Points"]),
+                            "gold_label_4way": row["Reward"],
+                            "pred_points": grade["score_0_7"],
+                            "pred_label_4way": grade["label_4way"],
+                            "judge_response": grade["judge_response"],
+                        }
+                    )
+                append_jsonl(output_path, judged_rows)
+        else:
+            judged_rows = []
+            for row in pending:
+                grade = judge.judge_gradingbench(
+                    grading_id=row["Grading ID"],
+                    problem_id=row["Problem ID"],
+                    problem=row["Problem"],
+                    proposed_solution=row["Response"],
+                )
+                judged_rows.append(
+                    {
+                        "benchmark": "gradingbench",
+                        "grading_id": row["Grading ID"],
+                        "problem_id": row["Problem ID"],
+                        "problem_source": row["Problem Source"],
+                        "gold_points": safe_int(row["Points"]),
+                        "gold_label_4way": row["Reward"],
+                        "pred_points": grade["score_0_7"],
+                        "pred_label_4way": grade["label_4way"],
+                        "judge_response": grade["judge_response"],
+                    }
+                )
+            append_jsonl(output_path, judged_rows)
     return load_jsonl(output_path)
 
 
@@ -1753,7 +1942,14 @@ def parse_args() -> argparse.Namespace:
         default=str(Path.cwd() / "imobench_runs" / now_tag()),
         help="Directory to store model artifacts and summaries.",
     )
+    parser.add_argument(
+        "--local-engine",
+        choices=("transformers", "vllm"),
+        default="transformers",
+        help="Runtime for local open-weight models used for solver generation and local_hf judges.",
+    )
     parser.add_argument("--batch-size", type=int, default=1, help="Local generation batch size.")
+    parser.add_argument("--judge-batch-size", type=int, default=1, help="Local GradingBench judge batch size.")
     parser.add_argument("--answer-max-new-tokens", type=int, default=2048)
     parser.add_argument("--proof-max-new-tokens", type=int, default=8192)
     parser.add_argument(
@@ -1819,6 +2015,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--judge-max-input-length", type=int, default=8192, help="Max prompt length for local HF judges.")
     parser.add_argument("--judge-max-new-tokens", type=int, default=256, help="Max new tokens for local HF judges.")
+    parser.add_argument(
+        "--vllm-max-model-len",
+        type=int,
+        default=0,
+        help="Optional vLLM max_model_len override. Defaults to max_input_length + max_new_tokens for the active task.",
+    )
+    parser.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help="Target fraction of visible GPU memory for vLLM's KV cache and weights.",
+    )
     parser.add_argument("--judge-temperature", type=float, default=0.0, help="Gemini grader temperature.")
     parser.add_argument("--judge-top-p", type=float, default=1.0, help="Gemini grader top-p.")
     parser.add_argument("--trust-remote-code", action="store_true")
@@ -1863,6 +2071,11 @@ def main() -> int:
         model_dir = ensure_dir(output_root / slugify(model_name))
         generator = None
         summary: Dict[str, Any] = {"model": model_name}
+        solver_max_new_tokens = 0
+        if "answerbench" in benchmarks:
+            solver_max_new_tokens = max(solver_max_new_tokens, args.answer_max_new_tokens)
+        if "proofbench" in benchmarks:
+            solver_max_new_tokens = max(solver_max_new_tokens, args.proof_max_new_tokens)
 
         if "answerbench" in benchmarks:
             if answer_judge is None:
@@ -1882,7 +2095,18 @@ def main() -> int:
                 else:
                     answer_judge = MathVerifyAnswerJudge()
             if generator is None:
-                generator = HFGenerator(model_name=model_name, trust_remote_code=args.trust_remote_code)
+                generator = build_local_generator(
+                    engine=args.local_engine,
+                    model_name=model_name,
+                    max_input_length=8192,
+                    trust_remote_code=args.trust_remote_code,
+                    max_model_len=resolve_local_max_model_len(
+                        max_input_length=8192,
+                        max_new_tokens=solver_max_new_tokens,
+                        explicit_max_model_len=args.vllm_max_model_len,
+                    ),
+                    vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                )
             answer_rows = run_answerbench(
                 model_name=model_name,
                 generator=generator,
@@ -1914,7 +2138,18 @@ def main() -> int:
             proof_prediction_path = model_dir / "proofbench_predictions.jsonl"
             needs_proof_generation = len(existing_ids(proof_prediction_path, "problem_id")) < len(proofbench_rows)
             if generator is None and needs_proof_generation:
-                generator = HFGenerator(model_name=model_name, trust_remote_code=args.trust_remote_code)
+                generator = build_local_generator(
+                    engine=args.local_engine,
+                    model_name=model_name,
+                    max_input_length=8192,
+                    trust_remote_code=args.trust_remote_code,
+                    max_model_len=resolve_local_max_model_len(
+                        max_input_length=8192,
+                        max_new_tokens=solver_max_new_tokens,
+                        explicit_max_model_len=args.vllm_max_model_len,
+                    ),
+                    vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                )
             proof_rows = run_proofbench(
                 model_name=model_name,
                 generator=generator,
@@ -1984,6 +2219,10 @@ def main() -> int:
                             max_input_length=args.judge_max_input_length,
                             max_new_tokens=args.judge_max_new_tokens,
                             trust_remote_code=args.trust_remote_code,
+                            engine=args.local_engine,
+                            batch_size=args.judge_batch_size,
+                            vllm_max_model_len=args.vllm_max_model_len,
+                            vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
                         ),
                     )
                 )
