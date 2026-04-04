@@ -300,6 +300,8 @@ class HFGenerator:
     model_name: str
     max_input_length: int = 8192
     trust_remote_code: bool = False
+    gpu_max_memory_gib: int = 0
+    cpu_max_memory_gib: int = 0
 
     def __post_init__(self) -> None:
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -311,12 +313,18 @@ class HFGenerator:
         self._uses_gpu = slurm_gpu_allocated()
         try:
             if self._uses_gpu:
+                load_kwargs: Dict[str, Any] = {
+                    "trust_remote_code": self.trust_remote_code,
+                    "dtype": torch.bfloat16,
+                    "device_map": "auto",
+                    "low_cpu_mem_usage": True,
+                }
+                max_memory = self._max_memory_map()
+                if max_memory:
+                    load_kwargs["max_memory"] = max_memory
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_name,
-                    trust_remote_code=self.trust_remote_code,
-                    dtype=torch.bfloat16,
-                    device_map="auto",
-                    low_cpu_mem_usage=True,
+                    **load_kwargs,
                 )
             else:
                 self.model = AutoModelForCausalLM.from_pretrained(
@@ -337,6 +345,17 @@ class HFGenerator:
             else:
                 raise
         self.model.eval()
+
+    def _max_memory_map(self) -> Dict[int | str, str] | None:
+        if not self._uses_gpu:
+            return None
+        limits: Dict[int | str, str] = {}
+        if self.gpu_max_memory_gib > 0:
+            for gpu_idx in range(visible_gpu_count()):
+                limits[gpu_idx] = f"{self.gpu_max_memory_gib}GiB"
+        if self.cpu_max_memory_gib > 0:
+            limits["cpu"] = f"{self.cpu_max_memory_gib}GiB"
+        return limits or None
 
     def _input_device(self) -> torch.device | None:
         try:
@@ -540,12 +559,16 @@ def build_local_generator(
     trust_remote_code: bool,
     max_model_len: int | None = None,
     vllm_gpu_memory_utilization: float = 0.9,
+    transformers_gpu_max_memory_gib: int = 0,
+    transformers_cpu_max_memory_gib: int = 0,
 ) -> TextGenerator:
     if engine == "transformers":
         return HFGenerator(
             model_name=model_name,
             max_input_length=max_input_length,
             trust_remote_code=trust_remote_code,
+            gpu_max_memory_gib=transformers_gpu_max_memory_gib,
+            cpu_max_memory_gib=transformers_cpu_max_memory_gib,
         )
     if engine == "vllm":
         return VLLMGenerator(
@@ -1275,6 +1298,8 @@ class LocalHFJudge(GeminiJudge):
         batch_size: int = 1,
         vllm_max_model_len: int = 0,
         vllm_gpu_memory_utilization: float = 0.9,
+        transformers_gpu_max_memory_gib: int = 0,
+        transformers_cpu_max_memory_gib: int = 0,
     ) -> None:
         self.model = model_name
         self.max_new_tokens = max_new_tokens
@@ -1290,6 +1315,8 @@ class LocalHFJudge(GeminiJudge):
                 explicit_max_model_len=vllm_max_model_len,
             ),
             vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
+            transformers_gpu_max_memory_gib=transformers_gpu_max_memory_gib,
+            transformers_cpu_max_memory_gib=transformers_cpu_max_memory_gib,
         )
 
     def _call_text(self, prompt: str) -> str:
@@ -2032,6 +2059,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--judge-max-input-length", type=int, default=8192, help="Max prompt length for local HF judges.")
     parser.add_argument("--judge-max-new-tokens", type=int, default=32768, help="Max new tokens for local HF judges.")
     parser.add_argument(
+        "--transformers-gpu-max-memory-gib",
+        type=int,
+        default=0,
+        help="Optional per-GPU memory cap in GiB for local transformers model loading. Useful for forcing CPU offload when a model barely fits.",
+    )
+    parser.add_argument(
+        "--transformers-cpu-max-memory-gib",
+        type=int,
+        default=0,
+        help="Optional CPU RAM cap in GiB for local transformers model loading when device_map=auto spills weights off GPU.",
+    )
+    parser.add_argument(
         "--vllm-max-model-len",
         type=int,
         default=0,
@@ -2122,6 +2161,8 @@ def main() -> int:
                         explicit_max_model_len=args.vllm_max_model_len,
                     ),
                     vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                    transformers_gpu_max_memory_gib=args.transformers_gpu_max_memory_gib,
+                    transformers_cpu_max_memory_gib=args.transformers_cpu_max_memory_gib,
                 )
             answer_rows = run_answerbench(
                 model_name=model_name,
@@ -2165,6 +2206,8 @@ def main() -> int:
                         explicit_max_model_len=args.vllm_max_model_len,
                     ),
                     vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                    transformers_gpu_max_memory_gib=args.transformers_gpu_max_memory_gib,
+                    transformers_cpu_max_memory_gib=args.transformers_cpu_max_memory_gib,
                 )
             proof_rows = run_proofbench(
                 model_name=model_name,
@@ -2239,6 +2282,8 @@ def main() -> int:
                             batch_size=args.judge_batch_size,
                             vllm_max_model_len=args.vllm_max_model_len,
                             vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                            transformers_gpu_max_memory_gib=args.transformers_gpu_max_memory_gib,
+                            transformers_cpu_max_memory_gib=args.transformers_cpu_max_memory_gib,
                         ),
                     )
                 )
