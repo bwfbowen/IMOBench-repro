@@ -314,7 +314,7 @@ class HFGenerator:
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_name,
                     trust_remote_code=self.trust_remote_code,
-                    torch_dtype=torch.bfloat16,
+                    dtype=torch.bfloat16,
                     device_map="auto",
                     low_cpu_mem_usage=True,
                 )
@@ -355,20 +355,35 @@ class HFGenerator:
         do_sample: bool,
         temperature: float,
         top_p: float,
+        max_new_tokens: int,
     ) -> Any | None:
         generation_config = getattr(self.model, "generation_config", None)
         if generation_config is None:
             return None
         generation_config = copy.deepcopy(generation_config)
         generation_config.do_sample = bool(do_sample)
+        generation_config.max_new_tokens = max_new_tokens
+        generation_config.pad_token_id = self.tokenizer.pad_token_id
+        generation_config.eos_token_id = self.tokenizer.eos_token_id
         if do_sample:
             generation_config.temperature = temperature
             generation_config.top_p = top_p
         else:
             # Some pretrained models ship sampling-only flags in generation_config.json.
             # Reset them for deterministic decoding so transformers does not warn.
-            generation_config.temperature = 1.0
-            generation_config.top_p = 1.0
+            reset_values = {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": 50,
+                "typical_p": 1.0,
+                "min_p": None,
+                "top_h": None,
+                "epsilon_cutoff": 0.0,
+                "eta_cutoff": 0.0,
+            }
+            for attr, value in reset_values.items():
+                if hasattr(generation_config, attr):
+                    setattr(generation_config, attr, value)
         return generation_config
 
     def generate(
@@ -398,18 +413,19 @@ class HFGenerator:
 
                 generate_kwargs: Dict[str, Any] = {
                     **enc,
-                    "max_new_tokens": max_new_tokens,
-                    "pad_token_id": self.tokenizer.pad_token_id,
-                    "eos_token_id": self.tokenizer.eos_token_id,
                 }
                 generation_config = self._generation_config_for_call(
                     do_sample=do_sample,
                     temperature=temperature,
                     top_p=top_p,
+                    max_new_tokens=max_new_tokens,
                 )
                 if generation_config is not None:
                     generate_kwargs["generation_config"] = generation_config
                 else:
+                    generate_kwargs["max_new_tokens"] = max_new_tokens
+                    generate_kwargs["pad_token_id"] = self.tokenizer.pad_token_id
+                    generate_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
                     generate_kwargs["do_sample"] = do_sample
                     if do_sample:
                         generate_kwargs["temperature"] = temperature
@@ -942,6 +958,76 @@ present your final score in the format below.
         response = self._call_text(prompt)
         return self._proof_grade_from_response_text(response)
 
+    def extract_gradingbench_label(self, model_response: str) -> str:
+        prompt = f"""
+## Instructions for Extracting Final Scores
+**Objective:** Given an response of an evaluation prompt, extract
+the final score presented within the response and format it
+specifically.
+
+**Process:**
+1. **Analyze the response:** Scan the response to identify the final
+score provided by the evaluator.
+2. **Extract and format the final answer:** Present the extracted
+score on a new line, preceded exactly by "Final answer: ".
+
+**Formatting Rules:**
+* **Evaluation Categories:** The expected output must be one
+of the following categories: 'correct', 'partial', 'almost',
+'incorrect', or 'not_found'.
+* **Score Identification:** The extraction is based on identifying
+the keyword used by the evaluator to summarize their conclusion.
+* **incorrect:** The evaluator concluded that the solution is
+completely incorrect or irrelevant.
+* **partial:** The evaluator concluded that the solution is
+partially correct but has significant errors or omissions.
+* **almost:** The evaluator concluded that the solution is almost
+correct but contains minor errors or inaccuracies.
+* **correct:** The evaluator concluded that the solution is fully
+correct and complete.
+* **not_found:** The evaluation response does not clearly contain
+one of the four explicit scores listed above.
+* **Extraction:** Determine the provided score from the response
+and extract the category ('correct', 'partial', 'almost', or
+'incorrect'). If a score cannot be reliably identified within
+the text, the output must be 'not_found'.
+**Note:** No additional markings or explanations are needed beyond
+"Final answer: " and the extracted answer.
+Below is the response:
+{model_response}
+""".strip()
+
+        response = self._call_text(prompt)
+        match = re.search(r"Final answer:\s*(correct|partial|almost|incorrect|not_found)", response, flags=re.IGNORECASE)
+        if not match:
+            return "not_found"
+        return match.group(1).lower()
+
+    def judge_gradingbench(
+        self,
+        grading_id: str,
+        problem_id: str,
+        problem: str,
+        proposed_solution: str,
+    ) -> Dict[str, Any]:
+        del grading_id, problem_id
+        prompt = gradingbench_prompt(problem=problem, proposed_solution=proposed_solution)
+        response = self._call_text(prompt)
+        return self._parse_gradingbench_response(response)
+
+    def _parse_gradingbench_response(self, response: str) -> Dict[str, Any]:
+        label = self._extract_label_from_text(response)
+        if label is None:
+            label = self.extract_gradingbench_label(response)
+        if label == "not_found":
+            label = "incorrect"
+        label = label.capitalize()
+        return {
+            "score_0_7": label_to_paper_points(label),
+            "label_4way": label,
+            "judge_response": response,
+        }
+
 
 class MathVerifyAnswerJudge:
     def __init__(self) -> None:
@@ -1177,76 +1263,6 @@ class MathVerifyAnswerJudge:
                 prediction_candidates[0] if prediction_candidates else None,
             ),
         }
-
-    def extract_gradingbench_label(self, model_response: str) -> str:
-        prompt = f"""
-## Instructions for Extracting Final Scores
-**Objective:** Given an response of an evaluation prompt, extract
-the final score presented within the response and format it
-specifically.
-
-**Process:**
-1. **Analyze the response:** Scan the response to identify the final
-score provided by the evaluator.
-2. **Extract and format the final answer:** Present the extracted
-score on a new line, preceded exactly by "Final answer: ".
-
-**Formatting Rules:**
-* **Evaluation Categories:** The expected output must be one
-of the following categories: 'correct', 'partial', 'almost',
-'incorrect', or 'not_found'.
-* **Score Identification:** The extraction is based on identifying
-the keyword used by the evaluator to summarize their conclusion.
-* **incorrect:** The evaluator concluded that the solution is
-completely incorrect or irrelevant.
-* **partial:** The evaluator concluded that the solution is
-partially correct but has significant errors or omissions.
-* **almost:** The evaluator concluded that the solution is almost
-correct but contains minor errors or inaccuracies.
-* **correct:** The evaluator concluded that the solution is fully
-correct and complete.
-* **not_found:** The evaluation response does not clearly contain
-one of the four explicit scores listed above.
-* **Extraction:** Determine the provided score from the response
-and extract the category ('correct', 'partial', 'almost', or
-'incorrect'). If a score cannot be reliably identified within
-the text, the output must be 'not_found'.
-**Note:** No additional markings or explanations are needed beyond
-"Final answer: " and the extracted answer.
-Below is the response:
-{model_response}
-""".strip()
-
-        response = self._call_text(prompt)
-        match = re.search(r"Final answer:\s*(correct|partial|almost|incorrect|not_found)", response, flags=re.IGNORECASE)
-        if not match:
-            return "not_found"
-        return match.group(1).lower()
-
-    def judge_gradingbench(
-        self,
-        grading_id: str,
-        problem_id: str,
-        problem: str,
-        proposed_solution: str,
-    ) -> Dict[str, Any]:
-        prompt = gradingbench_prompt(problem=problem, proposed_solution=proposed_solution)
-        response = self._call_text(prompt)
-        return self._parse_gradingbench_response(response)
-
-    def _parse_gradingbench_response(self, response: str) -> Dict[str, Any]:
-        label = self._extract_label_from_text(response)
-        if label is None:
-            label = self.extract_gradingbench_label(response)
-        if label == "not_found":
-            label = "incorrect"
-        label = label.capitalize()
-        return {
-            "score_0_7": label_to_paper_points(label),
-            "label_4way": label,
-            "judge_response": response,
-        }
-
 
 class LocalHFJudge(GeminiJudge):
     def __init__(
