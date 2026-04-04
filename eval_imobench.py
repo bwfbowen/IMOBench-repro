@@ -1965,7 +1965,7 @@ def parse_args() -> argparse.Namespace:
         help="Runtime for local open-weight models used for solver generation and local_hf judges.",
     )
     parser.add_argument("--batch-size", type=int, default=1, help="Local generation batch size.")
-    parser.add_argument("--judge-batch-size", type=int, default=1, help="Local GradingBench judge batch size.")
+    parser.add_argument("--judge-batch-size", type=int, default=256, help="Local GradingBench judge batch size.")
     parser.add_argument("--answer-max-new-tokens", type=int, default=2048)
     parser.add_argument("--proof-max-new-tokens", type=int, default=8192)
     parser.add_argument(
@@ -2030,7 +2030,7 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated local HF judge models to compare when --judge-backend=local_hf.",
     )
     parser.add_argument("--judge-max-input-length", type=int, default=8192, help="Max prompt length for local HF judges.")
-    parser.add_argument("--judge-max-new-tokens", type=int, default=256, help="Max new tokens for local HF judges.")
+    parser.add_argument("--judge-max-new-tokens", type=int, default=32768, help="Max new tokens for local HF judges.")
     parser.add_argument(
         "--vllm-max-model-len",
         type=int,
