@@ -2000,8 +2000,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--local-engine",
         choices=("transformers", "vllm"),
-        default="transformers",
-        help="Runtime for local open-weight models used for solver generation and local_hf judges.",
+        default="vllm",
+        help="Runtime for local open-weight models used for solver generation and local_hf judges. Default is vllm.",
     )
     parser.add_argument(
         "--batch-size",

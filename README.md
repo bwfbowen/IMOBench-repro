@@ -148,21 +148,20 @@ python3 eval_imobench.py \
   --output-root ./imobench_runs/gradingbench_local32b
 ```
 
-If you have `vllm` installed, you can switch the local runtime and batch GradingBench prompts:
+`vllm` is now the default local generation runtime. If you have it installed, you can batch GradingBench prompts like this:
 
 ```bash
 python3 eval_imobench.py \
   --benchmarks gradingbench \
   --judge-backend local_hf \
-  --local-engine vllm \
   --judge-batch-size 8 \
   --judge-models-csv "google/gemma-4-E4B-it" \
   --output-root ./imobench_runs/gradingbench_gemma4_e4b_vllm
 ```
 
 Notes:
-- `vllm` is optional and is not installed by `requirements.txt`.
-- Official Gemma 4 text-only runs also work with `--local-engine transformers`; you do not need `vllm` just to try Gemma 4.
+- `vllm` is not installed by `requirements.txt`; install it separately in environments where you want the default local generation path to work.
+- If you need the older path, pass `--local-engine transformers`.
 - On consumer GPUs, prefer setting `CUDA_VISIBLE_DEVICES` and keep `--vllm-max-model-len` capped to the task you are actually running instead of the model's full context window.
 
 ## Reproduction Notes
