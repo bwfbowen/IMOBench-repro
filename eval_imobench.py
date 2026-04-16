@@ -539,7 +539,7 @@ class VLLMGenerator:
             skip_special_tokens=True,
         )
         for prompt_batch in split_batches(rendered_prompts, batch_size):
-            generated = self.llm.generate(list(prompt_batch), sampling_params, use_tqdm=False)
+            generated = self.llm.generate(list(prompt_batch), sampling_params, use_tqdm=True)
             for request_output in generated:
                 candidates = getattr(request_output, "outputs", None) or []
                 if not candidates:
