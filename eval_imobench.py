@@ -197,6 +197,14 @@ def parse_csv_list(text: str) -> List[str]:
     return [item.strip() for item in text.split(",") if item.strip()]
 
 
+def resolve_generation_batch_size(batch_size: int, pending_count: int) -> int:
+    if pending_count <= 0:
+        return 1
+    if batch_size <= 0:
+        return pending_count
+    return batch_size
+
+
 def slurm_gpu_allocated() -> bool:
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
     return bool(visible and visible not in {"NoDevFiles", "-1"})
@@ -1523,10 +1531,11 @@ def run_answerbench(
         if not pending:
             continue
         prompts = [ensure_boxed_answer_prompt(row["Problem"]) for row in pending]
+        effective_batch_size = resolve_generation_batch_size(batch_size, len(prompts))
         outputs = generator.generate(
             prompts,
             max_new_tokens=max_new_tokens,
-            batch_size=batch_size,
+            batch_size=effective_batch_size,
             do_sample=do_sample,
             temperature=answer_temperature,
             top_p=answer_top_p,
@@ -1581,7 +1590,8 @@ def run_proofbench(
         if generator is None:
             raise RuntimeError("ProofBench generation requested without an initialized generator.")
         prompts = [proof_prompt(row["Problem"]) for row in pending_predictions]
-        outputs = generator.generate(prompts, max_new_tokens=max_new_tokens, batch_size=batch_size)
+        effective_batch_size = resolve_generation_batch_size(batch_size, len(prompts))
+        outputs = generator.generate(prompts, max_new_tokens=max_new_tokens, batch_size=effective_batch_size)
         result_rows = []
         for row, output in zip(pending_predictions, outputs):
             result_rows.append(
@@ -1991,7 +2001,12 @@ def parse_args() -> argparse.Namespace:
         default="transformers",
         help="Runtime for local open-weight models used for solver generation and local_hf judges.",
     )
-    parser.add_argument("--batch-size", type=int, default=1, help="Local generation batch size.")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help="Local generation batch size. Use 0 (default) to batch the full pending benchmark split/model stage.",
+    )
     parser.add_argument("--judge-batch-size", type=int, default=256, help="Local GradingBench judge batch size.")
     parser.add_argument("--answer-max-new-tokens", type=int, default=2048)
     parser.add_argument("--proof-max-new-tokens", type=int, default=32768)
