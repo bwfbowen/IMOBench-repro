@@ -1994,7 +1994,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1, help="Local generation batch size.")
     parser.add_argument("--judge-batch-size", type=int, default=256, help="Local GradingBench judge batch size.")
     parser.add_argument("--answer-max-new-tokens", type=int, default=2048)
-    parser.add_argument("--proof-max-new-tokens", type=int, default=8192)
+    parser.add_argument("--proof-max-new-tokens", type=int, default=32768)
     parser.add_argument(
         "--answer-runs",
         type=int,

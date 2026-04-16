@@ -98,7 +98,9 @@ python3 eval_imobench.py \
 This is the recommended path for full `ProofBench` judging. The evaluator
 submits one Gemini Batch API job per solver model, stores the batch metadata in
 `proofbench_batch_job.json`, and polls the same batch on reruns instead of
-blindly resubmitting another set of requests.
+blindly resubmitting another set of requests. The default proof-generation cap
+in this repo is `32768` tokens because many 1.5B proof outputs were visibly
+truncated at the older `8192` cap.
 
 ```bash
 export GEMINI_API_KEY='...'
@@ -106,6 +108,7 @@ python3 eval_imobench.py \
   --models deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B hbx/JustRL-DeepSeek-1.5B \
   --benchmarks proofbench \
   --gemini-model gemini-2.5-pro \
+  --proof-max-new-tokens 32768 \
   --proof-judge-mode batch \
   --batch-poll-seconds 30 \
   --output-root ./imobench_runs/proofbench_gemini_20260403
@@ -123,6 +126,7 @@ python3 eval_imobench.py \
   --models deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B hbx/JustRL-DeepSeek-1.5B \
   --benchmarks proofbench \
   --gemini-model gemini-2.5-pro \
+  --proof-max-new-tokens 32768 \
   --gemini-timeout 600 \
   --gemini-retries 5 \
   --proof-judge-mode realtime \
